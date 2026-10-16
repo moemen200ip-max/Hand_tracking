@@ -1,0 +1,380 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Hand tracking test</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #000; color: #e8eaed; font: 15px system-ui, sans-serif; }
+  #stage { position: fixed; inset: 0; display: grid; grid-template-columns: 1fr; }
+  #stage.vr { grid-template-columns: 1fr 1fr; }
+  canvas { width: 100%; height: 100%; min-width: 0; min-height: 0; object-fit: contain; }
+  #c2 { display: none; }
+  .vr #c2 { display: block; }
+  video { position: fixed; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+  #hud { position: fixed; top: 6px; left: 8px; right: 8px; font: 13px ui-monospace, monospace; color: #7fd6ff; pointer-events: none; text-shadow: 0 0 4px #000; }
+  #ui { position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 10px calc(10px + env(safe-area-inset-bottom, 0px)); background: rgba(16, 18, 22, .9);
+        display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); align-items: center; }
+  #ui.hide { display: none; }
+  button, select { font: inherit; padding: 10px; border-radius: 8px; border: 1px solid #3a4150; background: #232833; color: inherit; }
+  button.go { background: #1b6fa3; border-color: #1b6fa3; }
+  label { display: flex; gap: 8px; align-items: center; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="c"></canvas>
+  <canvas id="c2"></canvas>
+</div>
+<video id="v" playsinline muted></video>
+<div id="hud">Press Start. Tap the picture to hide or show controls.</div>
+<div id="ui">
+  <button class="go" id="start">Start</button>
+  <button id="fs">Fullscreen</button>
+  <select id="res">
+    <option value="320x240">Camera 320x240</option>
+    <option value="640x480" selected>Camera 640x480</option>
+    <option value="1280x720">Camera 1280x720</option>
+  </select>
+  <select id="hands"><option value="1">1 hand</option><option value="2" selected>2 hands</option></select>
+  <select id="delegate"><option value="GPU" selected>GPU</option><option value="CPU">CPU</option></select>
+  <label><input type="checkbox" id="cam" checked> Show camera</label>
+  <label><input type="checkbox" id="vr"> VR split view</label>
+</div>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const MODEL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+
+const $ = id => document.getElementById(id);
+const video = $("v"), cv = $("c"), ctx = cv.getContext("2d"), cv2 = $("c2"), ctx2 = cv2.getContext("2d");
+let landmarker, stream, running = false, lastT = -1, ema = 0, frames = 0, lastFps = performance.now(), handsSeen = 0, pinching = false;
+
+const fistUntil = [0, 0];
+let fisting = false;
+
+// --- Gun tracking states & bullets ---
+const gunStates = [
+  { isGun: false, thumbWasUp: false, recoil: 0 },
+  { isGun: false, thumbWasUp: false, recoil: 0 }
+];
+const bullets = [];
+
+// Web Audio API Synthesizer for gunshot sound
+let audioCtx = null;
+function playGunshotSound() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+
+  const now = audioCtx.currentTime;
+  
+  // Noise buffer for the blast explosion
+  const bufferSize = audioCtx.sampleRate * 0.15;
+  const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i = 0; i < bufferSize; i++) {
+    data[i] = Math.random() * 2 - 1;
+  }
+
+  const noise = audioCtx.createBufferSource();
+  noise.buffer = buffer;
+
+  const filter = audioCtx.createBiquadFilter();
+  filter.type = 'lowpass';
+  filter.frequency.setValueAtTime(1000, now);
+  filter.frequency.exponentialRampToValueAtTime(100, now + 0.15);
+
+  const gain = audioCtx.createGain();
+  gain.gain.setValueAtTime(0.8, now);
+  gain.gain.exponentialRampToValueAtTime(0.01, now + 0.15);
+
+  noise.connect(filter);
+  filter.connect(gain);
+  gain.connect(audioCtx.destination);
+
+  noise.start(now);
+}
+
+const say = m => { $("hud").textContent = m; };
+
+async function makeLandmarker(fileset, delegate) {
+  return HandLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath: MODEL, delegate },
+    runningMode: "VIDEO",
+    numHands: +$("hands").value
+  });
+}
+
+function stop() {
+  running = false;
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (landmarker) landmarker.close();
+  landmarker = null;
+}
+
+async function start() {
+  stop();
+  if (!window.isSecureContext) { say("Camera needs HTTPS or http://localhost"); return; }
+  try {
+    say("Loading model...");
+    const fileset = await FilesetResolver.forVisionTasks(WASM);
+    try { landmarker = await makeLandmarker(fileset, $("delegate").value); }
+    catch (e) { say("GPU failed, using CPU..."); $("delegate").value = "CPU"; landmarker = await makeLandmarker(fileset, "CPU"); }
+
+    const [w, h] = $("res").value.split("x").map(Number);
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" }, width: { ideal: w }, height: { ideal: h } }, audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+    cv.width = cv2.width = video.videoWidth;
+    cv.height = cv2.height = video.videoHeight;
+    try { await navigator.wakeLock.request("screen"); } catch (e) {}
+    running = true; lastT = -1;
+    say("Running");
+    requestAnimationFrame(loop);
+  } catch (e) { say("Error: " + e.message); }
+}
+
+function loop() {
+  if (!running) return;
+  if (video.currentTime !== lastT) {
+    lastT = video.currentTime;
+    const t0 = performance.now();
+    const res = landmarker.detectForVideo(video, t0);
+    const dt = performance.now() - t0;
+    ema = ema ? ema * 0.9 + dt * 0.1 : dt;
+    draw(res);
+    frames++;
+    const now = performance.now();
+    if (now - lastFps >= 1000) {
+      const fps = frames * 1000 / (now - lastFps);
+      frames = 0; lastFps = now;
+      const gunActive = gunStates.some(g => g.isGun);
+      say(fps.toFixed(0) + " fps | " + ema.toFixed(0) + " ms/frame | hands " + handsSeen + (gunActive ? " | GUN READY" : "") + (fisting ? " | FIST" : ""));
+    }
+  }
+  requestAnimationFrame(loop);
+}
+
+function isFist(p) {
+  const d = (a, b) => Math.hypot(p[a].x - p[b].x, p[a].y - p[b].y);
+  return [[8, 6], [12, 10], [16, 14], [20, 18]].filter(([tip, pip]) => d(tip, 0) < d(pip, 0)).length >= 4;
+}
+
+// Check for gun gesture
+function checkGunPose(p) {
+  const d = (a, b) => Math.hypot(p[a].x - p[b].x, p[a].y - p[b].y);
+  
+  // Index extended
+  const indexExtended = d(8, 0) > d(6, 0);
+  // Ring & Pinky curled in
+  const ringCurled = d(16, 0) < d(14, 0);
+  const pinkyCurled = d(20, 0) < d(18, 0);
+
+  const isGun = indexExtended && ringCurled && pinkyCurled;
+  
+  if (!isGun) return { isGun: false, thumbUp: false };
+
+  // Check if thumb is pointing up relative to the index finger/hand direction
+  const handSize = d(0, 9);
+  const thumbDistFromIndexBase = d(4, 5);
+  const thumbUp = (thumbDistFromIndexBase / handSize) > 0.45;
+
+  return { isGun: true, thumbUp };
+}
+
+function drawGun(p, W, H, handIdx) {
+  const state = gunStates[handIdx];
+  const X = i => p[i].x * W, Y = i => p[i].y * H;
+  
+  // Position barrel along the index finger (MCP -> Tip)
+  const barrelBaseX = X(5), barrelBaseY = Y(5);
+  const tipX = X(8), tipY = Y(8);
+  const angle = Math.atan2(tipY - barrelBaseY, tipX - barrelBaseX);
+  const s = Math.hypot(X(0) - X(9), Y(0) - Y(9)); // Hand scale factor
+
+  // Apply recoil kickback
+  const recoilOffset = state.recoil * 0.2 * s;
+  const recoilAngle = state.recoil * 0.15;
+
+  ctx.save();
+  ctx.translate(barrelBaseX, barrelBaseY);
+  ctx.rotate(angle - recoilAngle);
+  ctx.translate(-recoilOffset, 0);
+
+  // Gun Body & Slide (Metallic Gray)
+  ctx.fillStyle = "#3a3d40";
+  ctx.fillRect(-0.1 * s, -0.25 * s, 1.2 * s, 0.3 * s);
+
+  // Barrel Top (Darker metallic finish)
+  ctx.fillStyle = "#222528";
+  ctx.fillRect(0.1 * s, -0.25 * s, 1.2 * s, 0.12 * s);
+
+  // Handle / Grip
+  ctx.fillStyle = "#1e2022";
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.lineTo(-0.3 * s, 0.6 * s);
+  ctx.lineTo(-0.05 * s, 0.65 * s);
+  ctx.lineTo(0.25 * s, 0.05 * s);
+  ctx.closePath();
+  ctx.fill();
+
+  // Hammer (Toggles position depending on thumb state)
+  ctx.fillStyle = "#55585c";
+  ctx.save();
+  ctx.translate(-0.1 * s, -0.22 * s);
+  ctx.rotate(state.thumbWasUp ? -0.4 : 0.1);
+  ctx.fillRect(-0.15 * s, -0.05 * s, 0.15 * s, 0.1 * s);
+  ctx.restore();
+
+  // Muzzle flash when fired
+  if (state.recoil > 0.6) {
+    ctx.fillStyle = "#ffcc00";
+    ctx.beginPath();
+    ctx.arc(1.4 * s, -0.1 * s, 0.3 * s, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = "#ffffff";
+    ctx.beginPath();
+    ctx.arc(1.4 * s, -0.1 * s, 0.15 * s, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  ctx.restore();
+
+  // Fire bullet & trigger recoil when thumb flicks down
+  if (state.thumbWasUp && !state.currentThumbUp) {
+    state.recoil = 1.0;
+    playGunshotSound();
+
+    // Spawn bullet at tip of barrel
+    const muzzleX = barrelBaseX + Math.cos(angle) * (1.3 * s);
+    const muzzleY = barrelBaseY + Math.sin(angle) * (1.3 * s);
+    const speed = 25;
+
+    bullets.push({
+      x: muzzleX,
+      y: muzzleY,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      life: 60
+    });
+  }
+
+  // Decay recoil animation
+  state.recoil *= 0.8;
+  state.thumbWasUp = state.currentThumbUp;
+}
+
+function updateAndDrawBullets(W, H) {
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i];
+    b.x += b.vx;
+    b.y += b.vy;
+    b.life--;
+
+    // Render bullet trail and projectile
+    ctx.strokeStyle = "#ffaa00";
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(b.x, b.y);
+    ctx.lineTo(b.x - b.vx * 1.5, b.y - b.vy * 1.5);
+    ctx.stroke();
+
+    ctx.fillStyle = "#ffffff";
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, 4, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Remove off-screen or expired bullets
+    if (b.life <= 0 || b.x < 0 || b.x > W || b.y < 0 || b.y > H) {
+      bullets.splice(i, 1);
+    }
+  }
+}
+
+function drawSword(p, W, H) {
+  const X = i => p[i].x * W, Y = i => p[i].y * H;
+  const cx = (X(5) + X(9) + X(13) + X(17)) / 4, cy = (Y(5) + Y(9) + Y(13) + Y(17)) / 4;
+  const ang = Math.atan2(Y(5) - Y(17), X(5) - X(17));
+  const s = Math.hypot(X(0) - X(9), Y(0) - Y(9));
+  ctx.save();
+  ctx.translate(cx, cy); ctx.rotate(ang);
+  ctx.fillStyle = "#6b3f1d"; ctx.fillRect(-0.45 * s, -0.07 * s, 0.9 * s, 0.14 * s);
+  ctx.fillStyle = "#e0b84a"; ctx.fillRect(0.45 * s, -0.4 * s, 0.1 * s, 0.8 * s);
+  ctx.beginPath(); ctx.arc(-0.47 * s, 0, 0.1 * s, 0, 6.283); ctx.fill();
+  ctx.fillStyle = "#dfeaf2";
+  ctx.beginPath();
+  ctx.moveTo(0.55 * s, -0.1 * s); ctx.lineTo(2.1 * s, -0.1 * s); ctx.lineTo(2.35 * s, 0);
+  ctx.lineTo(2.1 * s, 0.1 * s); ctx.lineTo(0.55 * s, 0.1 * s); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = "#8fb4c9"; ctx.lineWidth = 0.025 * s;
+  ctx.beginPath(); ctx.moveTo(0.55 * s, 0); ctx.lineTo(2.2 * s, 0); ctx.stroke();
+  ctx.restore();
+}
+
+function draw(res) {
+  const W = cv.width, H = cv.height;
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, W, H);
+  if ($("cam").checked) { ctx.globalAlpha = 0.6; ctx.drawImage(video, 0, 0, W, H); ctx.globalAlpha = 1; }
+  handsSeen = res.landmarks.length; pinching = false; fisting = false;
+  const lw = Math.max(2, W / 200);
+
+  // Reset active state if no hands seen
+  if (handsSeen === 0) {
+    gunStates[0].isGun = false;
+    gunStates[1].isGun = false;
+  }
+
+  for (const [i, p] of res.landmarks.entries()) {
+    const now = performance.now();
+    const gunCheck = checkGunPose(p);
+
+    if (gunCheck.isGun) {
+      gunStates[i].isGun = true;
+      gunStates[i].currentThumbUp = gunCheck.thumbUp;
+      drawGun(p, W, H, i);
+    } else {
+      gunStates[i].isGun = false;
+      if (isFist(p)) fistUntil[i] = now + 250;
+      if (now < fistUntil[i]) { drawSword(p, W, H); fisting = true; }
+    }
+
+    ctx.strokeStyle = "#4cc3ff"; ctx.lineWidth = lw;
+    ctx.beginPath();
+    for (const { start, end } of HandLandmarker.HAND_CONNECTIONS) {
+      ctx.moveTo(p[start].x * W, p[start].y * H);
+      ctx.lineTo(p[end].x * W, p[end].y * H);
+    }
+    ctx.stroke();
+    ctx.fillStyle = "#fff";
+    for (const q of p) { ctx.beginPath(); ctx.arc(q.x * W, q.y * H, lw * 1.2, 0, 6.283); ctx.fill(); }
+    const d = (a, b) => Math.hypot(p[a].x - p[b].x, p[a].y - p[b].y);
+    if (d(4, 8) / d(0, 9) < 0.3) {
+      pinching = true;
+      ctx.fillStyle = "#ff5a5a";
+      ctx.beginPath();
+      ctx.arc((p[4].x + p[8].x) / 2 * W, (p[4].y + p[8].y) / 2 * H, lw * 4, 0, 6.283);
+      ctx.fill();
+    }
+  }
+
+  updateAndDrawBullets(W, H);
+
+  if ($("vr").checked) ctx2.drawImage(cv, 0, 0);
+}
+
+$("start").onclick = start;
+$("vr").onchange = () => $("stage").classList.toggle("vr", $("vr").checked);
+$("fs").onclick = async () => {
+  try { await document.documentElement.requestFullscreen(); await screen.orientation.lock("landscape"); } catch (e) {}
+};
+$("stage").onclick = () => $("ui").classList.toggle("hide");
+</script>
+</body>
+</html>
